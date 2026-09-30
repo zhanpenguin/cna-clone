@@ -1,0 +1,23 @@
+{
+  "name": "cna-clone",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A training project that replicates the CNA news site layout with a content management backend.",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,client -c red,cyan \"npm run dev --workspace server\" \"npm run dev --workspace client\"",
+    "build": "npm run build --workspace client",
+    "start": "npm run start --workspace server",
+    "test:api": "node --test server/test/api.test.js",
+    "test:unit": "npm run test --workspace client",
+    "test:e2e": "playwright test",
+    "test": "npm run test:api && npm run test:unit && npm run test:e2e"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "concurrently": "^9.1.0"
+  }
+}
