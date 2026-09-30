@@ -1,25 +1,38 @@
 import express from "express";
 import cors from "cors";
-import fs from "node:fs";
-import path from "node:path";
 import crypto from "node:crypto";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { createClient } from "@supabase/supabase-js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-
-const supabase =
-  SUPABASE_URL && SUPABASE_ANON_KEY
-    ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
-    : null;
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
+const REST_BASE = SUPABASE_URL ? `${SUPABASE_URL}/rest/v1` : "";
 
 function assertDb() {
-  if (!supabase) {
+  if (!REST_BASE || !SUPABASE_ANON_KEY) {
     throw new Error("Supabase is not configured — set SUPABASE_URL and SUPABASE_ANON_KEY");
   }
+}
+
+function pgHeaders(extra = {}) {
+  return {
+    apikey: SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+    ...extra,
+  };
+}
+
+async function pg(path, { method = "GET", body, headers = {} } = {}) {
+  assertDb();
+  const init = { method, headers: pgHeaders(headers) };
+  if (body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = typeof body === "string" ? body : JSON.stringify(body);
+  }
+  const res = await fetch(`${REST_BASE}${path}`, init);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Supabase error ${res.status}: ${text.slice(0, 300)}`);
+  }
+  return res;
 }
 
 const defaultSettings = () => ({
@@ -76,31 +89,25 @@ const articleRow = (a) => ({
 });
 
 async function allArticlesSorted() {
-  assertDb();
-  const { data, error } = await supabase.from("articles").select("*");
-  if (error) throw error;
-  return (data || [])
+  const res = await pg("/articles?select=*");
+  const data = await res.json();
+  return data
     .map(rowToArticle)
     .sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
 }
 
 async function getMeta(key, fallback) {
-  assertDb();
-  const { data, error } = await supabase
-    .from("meta")
-    .select("value")
-    .eq("key", key)
-    .maybeSingle();
-  if (error) throw error;
-  return data ? JSON.parse(data.value) : fallback;
+  const res = await pg(`/meta?select=value&key=eq.${encodeURIComponent(key)}`);
+  const data = await res.json();
+  return data.length ? JSON.parse(data[0].value) : fallback;
 }
 
 async function setMeta(key, value) {
-  assertDb();
-  const { error } = await supabase
-    .from("meta")
-    .upsert({ key, value: JSON.stringify(value) }, { onConflict: "key" });
-  if (error) throw error;
+  await pg("/meta", {
+    method: "POST",
+    body: { key, value: JSON.stringify(value) },
+    headers: { Prefer: "resolution=merge-duplicates" },
+  });
 }
 
 // --- Auth (demo only) -------------------------------------------------------
@@ -170,25 +177,19 @@ app.get(
 app.get(
   "/api/articles/:id",
   asyncRoute(async (req, res) => {
-    assertDb();
-    const { data, error } = await supabase
-      .from("articles")
-      .select("*")
-      .eq("id", req.params.id)
-      .maybeSingle();
-    if (error) throw error;
-    if (!data) return res.status(404).json({ error: "Not found" });
-    res.json(rowToArticle(data));
+    const r = await pg(`/articles?select=*&id=eq.${encodeURIComponent(req.params.id)}`);
+    const data = await r.json();
+    if (!data.length) return res.status(404).json({ error: "Not found" });
+    res.json(rowToArticle(data[0]));
   })
 );
 
 app.get(
   "/api/categories",
   asyncRoute(async (_req, res) => {
-    assertDb();
-    const { data, error } = await supabase.from("categories").select("*").order("ord");
-    if (error) throw error;
-    res.json((data || []).map(rowToCategory));
+    const r = await pg("/categories?select=*&order=ord.asc");
+    const data = await r.json();
+    res.json(data.map(rowToCategory));
   })
 );
 
@@ -197,10 +198,8 @@ app.get(
   asyncRoute(async (_req, res) => {
     const ids = await getMeta("trending", []);
     if (!ids.length) return res.json([]);
-    assertDb();
-    const { data, error } = await supabase.from("articles").select("*").in("id", ids);
-    if (error) throw error;
-    const rows = data || [];
+    const r = await pg(`/articles?select=*&id=in.(${ids.map(encodeURIComponent).join(",")})`);
+    const rows = await r.json();
     const list = ids
       .map((id) => rows.find((a) => a.id === id))
       .filter(Boolean)
@@ -220,9 +219,8 @@ app.get(
 app.get("/api/health", (_req, res) => {
   res.json({
     ok: true,
-    supabaseConfigured: !!supabase,
+    supabaseConfigured: !!(REST_BASE && SUPABASE_ANON_KEY),
     supabaseUrl: SUPABASE_URL || null,
-    hasAnonKey: !!SUPABASE_ANON_KEY,
   });
 });
 
@@ -242,18 +240,13 @@ app.post(
     const body = req.body || {};
     const title = typeof body.title === "string" ? body.title.trim() : "";
     if (!title) return res.status(400).json({ error: "Title is required" });
-    assertDb();
-    const { data: firstCategory } = await supabase
-      .from("categories")
-      .select("slug")
-      .order("ord")
-      .limit(1)
-      .maybeSingle();
+    const catRes = await pg("/categories?select=slug&order=ord.asc&limit=1");
+    const cats = await catRes.json();
     const article = {
       id: `art-${Date.now()}`,
       title: "",
       summary: "",
-      category: firstCategory?.slug || "singapore",
+      category: cats[0]?.slug || "singapore",
       author: null,
       imageUrl: "",
       publishedAt: new Date().toISOString(),
@@ -268,13 +261,13 @@ app.post(
       ...body,
       title,
     };
-    const { data, error } = await supabase
-      .from("articles")
-      .insert(articleRow(article))
-      .select()
-      .single();
-    if (error) throw error;
-    res.status(201).json(rowToArticle(data));
+    const r = await pg("/articles", {
+      method: "POST",
+      body: articleRow(article),
+      headers: { Prefer: "return=representation" },
+    });
+    const data = await r.json();
+    res.status(201).json(rowToArticle(Array.isArray(data) ? data[0] : data));
   })
 );
 
@@ -282,23 +275,17 @@ app.put(
   "/api/admin/articles/:id",
   requireAuth,
   asyncRoute(async (req, res) => {
-    assertDb();
-    const { data: existing, error: findErr } = await supabase
-      .from("articles")
-      .select("*")
-      .eq("id", req.params.id)
-      .maybeSingle();
-    if (findErr) throw findErr;
-    if (!existing) return res.status(404).json({ error: "Not found" });
-    const merged = { ...rowToArticle(existing), ...(req.body || {}), id: req.params.id };
-    const { data, error } = await supabase
-      .from("articles")
-      .update(articleRow(merged))
-      .eq("id", req.params.id)
-      .select()
-      .single();
-    if (error) throw error;
-    res.json(rowToArticle(data));
+    const found = await pg(`/articles?select=*&id=eq.${encodeURIComponent(req.params.id)}`);
+    const existing = await found.json();
+    if (!existing.length) return res.status(404).json({ error: "Not found" });
+    const merged = { ...rowToArticle(existing[0]), ...(req.body || {}), id: req.params.id };
+    const r = await pg(`/articles?id=eq.${encodeURIComponent(req.params.id)}`, {
+      method: "PATCH",
+      body: articleRow(merged),
+      headers: { Prefer: "return=representation" },
+    });
+    const data = await r.json();
+    res.json(rowToArticle(Array.isArray(data) ? data[0] : data));
   })
 );
 
@@ -306,16 +293,10 @@ app.delete(
   "/api/admin/articles/:id",
   requireAuth,
   asyncRoute(async (req, res) => {
-    assertDb();
-    const { data: existing, error: findErr } = await supabase
-      .from("articles")
-      .select("id")
-      .eq("id", req.params.id)
-      .maybeSingle();
-    if (findErr) throw findErr;
-    if (!existing) return res.status(404).json({ error: "Not found" });
-    const { error } = await supabase.from("articles").delete().eq("id", req.params.id);
-    if (error) throw error;
+    const found = await pg(`/articles?select=id&id=eq.${encodeURIComponent(req.params.id)}`);
+    const existing = await found.json();
+    if (!existing.length) return res.status(404).json({ error: "Not found" });
+    await pg(`/articles?id=eq.${encodeURIComponent(req.params.id)}`, { method: "DELETE" });
     const ids = (await getMeta("trending", [])).filter((id) => id !== req.params.id);
     await setMeta("trending", ids);
     res.json({ ok: true });
@@ -329,32 +310,24 @@ app.post(
     const body = req.body || {};
     if (!body.name || !body.slug)
       return res.status(400).json({ error: "Name and slug are required" });
-    assertDb();
-    const { data: existing } = await supabase
-      .from("categories")
-      .select("slug")
-      .eq("slug", body.slug)
-      .maybeSingle();
-    if (existing) return res.status(409).json({ error: "Slug already exists" });
-    const { data: maxRow } = await supabase
-      .from("categories")
-      .select("ord")
-      .order("ord", { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const dupRes = await pg(`/categories?select=slug&slug=eq.${encodeURIComponent(body.slug)}`);
+    const dup = await dupRes.json();
+    if (dup.length) return res.status(409).json({ error: "Slug already exists" });
+    const maxRes = await pg("/categories?select=ord&order=ord.desc&limit=1");
+    const maxRows = await maxRes.json();
     const category = {
       id: `cat-${Date.now()}`,
       name: body.name,
       slug: body.slug,
-      ord: (maxRow?.ord || 0) + 1,
+      ord: (maxRows[0]?.ord || 0) + 1,
     };
-    const { data, error } = await supabase
-      .from("categories")
-      .insert({ id: category.id, name: category.name, slug: category.slug, ord: category.ord })
-      .select()
-      .single();
-    if (error) throw error;
-    res.status(201).json(rowToCategory(data));
+    const r = await pg("/categories", {
+      method: "POST",
+      body: { id: category.id, name: category.name, slug: category.slug, ord: category.ord },
+      headers: { Prefer: "return=representation" },
+    });
+    const data = await r.json();
+    res.status(201).json(rowToCategory(Array.isArray(data) ? data[0] : data));
   })
 );
 
@@ -362,30 +335,22 @@ app.put(
   "/api/admin/categories/:id",
   requireAuth,
   asyncRoute(async (req, res) => {
-    assertDb();
-    const { data: existing, error: findErr } = await supabase
-      .from("categories")
-      .select("*")
-      .eq("id", req.params.id)
-      .maybeSingle();
-    if (findErr) throw findErr;
-    if (!existing) return res.status(404).json({ error: "Not found" });
-    const merged = { ...rowToCategory(existing), ...(req.body || {}), id: req.params.id };
-    const { data: dup } = await supabase
-      .from("categories")
-      .select("id")
-      .eq("slug", merged.slug)
-      .neq("id", merged.id)
-      .maybeSingle();
-    if (dup) return res.status(409).json({ error: "Slug already exists" });
-    const { data, error } = await supabase
-      .from("categories")
-      .update({ name: merged.name, slug: merged.slug, ord: merged.ord })
-      .eq("id", req.params.id)
-      .select()
-      .single();
-    if (error) throw error;
-    res.json(rowToCategory(data));
+    const found = await pg(`/categories?select=*&id=eq.${encodeURIComponent(req.params.id)}`);
+    const existing = await found.json();
+    if (!existing.length) return res.status(404).json({ error: "Not found" });
+    const merged = { ...rowToCategory(existing[0]), ...(req.body || {}), id: req.params.id };
+    const dupRes = await pg(
+      `/categories?select=id&slug=eq.${encodeURIComponent(merged.slug)}&id=neq.${encodeURIComponent(merged.id)}`
+    );
+    const dup = await dupRes.json();
+    if (dup.length) return res.status(409).json({ error: "Slug already exists" });
+    const r = await pg(`/categories?id=eq.${encodeURIComponent(req.params.id)}`, {
+      method: "PATCH",
+      body: { name: merged.name, slug: merged.slug, ord: merged.ord },
+      headers: { Prefer: "return=representation" },
+    });
+    const data = await r.json();
+    res.json(rowToCategory(Array.isArray(data) ? data[0] : data));
   })
 );
 
@@ -393,16 +358,10 @@ app.delete(
   "/api/admin/categories/:id",
   requireAuth,
   asyncRoute(async (req, res) => {
-    assertDb();
-    const { data: existing, error: findErr } = await supabase
-      .from("categories")
-      .select("id")
-      .eq("id", req.params.id)
-      .maybeSingle();
-    if (findErr) throw findErr;
-    if (!existing) return res.status(404).json({ error: "Not found" });
-    const { error } = await supabase.from("categories").delete().eq("id", req.params.id);
-    if (error) throw error;
+    const found = await pg(`/categories?select=id&id=eq.${encodeURIComponent(req.params.id)}`);
+    const existing = await found.json();
+    if (!existing.length) return res.status(404).json({ error: "Not found" });
+    await pg(`/categories?id=eq.${encodeURIComponent(req.params.id)}`, { method: "DELETE" });
     res.json({ ok: true });
   })
 );
@@ -413,9 +372,9 @@ app.put(
   asyncRoute(async (req, res) => {
     const { ids } = req.body || {};
     if (!Array.isArray(ids)) return res.status(400).json({ error: "ids array required" });
-    assertDb();
-    const { data } = await supabase.from("articles").select("id").in("id", ids);
-    const existingIds = new Set((data || []).map((a) => a.id));
+    const r = await pg(`/articles?select=id&id=in.(${ids.map(encodeURIComponent).join(",")})`);
+    const rows = await r.json();
+    const existingIds = new Set(rows.map((a) => a.id));
     const valid = ids.filter((id) => existingIds.has(id));
     await setMeta("trending", valid);
     res.json(valid);
@@ -487,15 +446,6 @@ app.get(
   })
 );
 
-// --- Serve built client (optional, for `npm run build` + `npm start`) --------
-const clientDist = path.join(__dirname, "..", "client", "dist");
-if (fs.existsSync(clientDist)) {
-  app.use(express.static(clientDist));
-  app.get(/^(?!\/api).*/, (_req, res) => {
-    res.sendFile(path.join(clientDist, "index.html"));
-  });
-}
-
 // --- Error handler ----------------------------------------------------------
 app.use((err, _req, res, _next) => {
   console.error(err);
@@ -512,7 +462,7 @@ export function createApp() {
 }
 
 // Only auto-listen when run directly (not when imported by tests)
-const isMain = process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
+const isMain = process.argv[1] && process.argv[1] === import.meta.url.replace("file://", "");
 if (isMain) {
   app.listen(PORT, () => {
     console.log(`CNA clone API running at http://localhost:${PORT}`);
