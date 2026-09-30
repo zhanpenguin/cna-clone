@@ -216,6 +216,16 @@ app.get(
   })
 );
 
+// --- Health check (diagnostics) ---------------------------------------------
+app.get("/api/health", (_req, res) => {
+  res.json({
+    ok: true,
+    supabaseConfigured: !!supabase,
+    supabaseUrl: SUPABASE_URL || null,
+    hasAnonKey: !!SUPABASE_ANON_KEY,
+  });
+});
+
 // --- Admin routes -----------------------------------------------------------
 app.get(
   "/api/admin/articles",
@@ -489,7 +499,10 @@ if (fs.existsSync(clientDist)) {
 // --- Error handler ----------------------------------------------------------
 app.use((err, _req, res, _next) => {
   console.error(err);
-  res.status(500).json({ error: "Internal server error" });
+  res.status(500).json({
+    error: "Internal server error",
+    detail: err?.message || String(err),
+  });
 });
 
 const PORT = process.env.PORT || 4000;
