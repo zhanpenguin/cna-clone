@@ -2,6 +2,7 @@
   "name": "cna-clone",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "A training project that replicates the CNA news site layout with a content management backend.",
   "workspaces": [
     "server",
